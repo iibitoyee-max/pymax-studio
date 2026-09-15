@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PryMax Studio — Room</title>
+<link rel="stylesheet" href="room.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <a href="#sidebar-tabs" class="skip-link">Skip to chat, polls, Q&amp;A and controls</a>
+
+  <div id="join-screen" class="join-screen">
+    <div class="join-card">
+      <div class="tally"><span class="tally-dot" aria-hidden="true"></span>SIGNAL STANDBY</div>
+      <h1>Enter the studio</h1>
+      <label for="name-input">Your name</label>
+      <input id="name-input" type="text" placeholder="Jamie Rivera" autocomplete="name">
+      <label for="room-input">Room</label>
+      <input id="room-input" type="text" placeholder="q3-product-briefing">
+      <label for="host-token-input">Host token <span class="optional-tag">(leave blank to join as attendee)</span></label>
+      <input id="host-token-input" type="text" placeholder="Paste a host token, or claim one below">
+      <button id="join-btn">Go live</button>
+      <button id="claim-host-btn" class="claim-host-btn" type="button">Claim host for this room</button>
+      <div id="claim-result" class="claim-result hidden" role="status" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <div id="studio" class="studio hidden">
+    <header class="topbar">
+      <div class="brand">PRYMAX <span>STUDIO</span></div>
+      <div class="tally live"><span class="tally-dot" aria-hidden="true"></span>LIVE</div>
+      <div class="session-title" id="session-title"></div>
+      <div class="mode-badge" id="mode-badge" title="Intended delivery profile — label only, not an active pipeline"></div>
+      <div class="host-badge hidden" id="host-badge">HOST</div>
+      <div class="timecode" id="timecode" aria-label="Elapsed session time">00:00:00</div>
+      <div class="peer-count" id="peer-count" role="status" aria-live="polite">1 in room</div>
+    </header>
+
+    <main class="stage-area" aria-label="Video stage">
+      <div id="video-grid" class="video-grid"></div>
+    </main>
+
+    <aside class="sidebar" aria-label="Chat, polls, Q&amp;A and controls">
+      <div class="tabs" id="sidebar-tabs" role="tablist" aria-label="Room panels">
+        <button class="tab active" id="tab-chat" data-tab="chat" role="tab" aria-selected="true" aria-controls="panel-chat" tabindex="0">Chat</button>
+        <button class="tab" id="tab-polls" data-tab="polls" role="tab" aria-selected="false" aria-controls="panel-polls" tabindex="-1">Polls</button>
+        <button class="tab" id="tab-qa" data-tab="qa" role="tab" aria-selected="false" aria-controls="panel-qa" tabindex="-1">Q&amp;A</button>
+        <button class="tab" id="tab-more" data-tab="more" role="tab" aria-selected="false" aria-controls="panel-more" tabindex="-1">More</button>
+      </div>
+
+      <div class="tab-panel" id="panel-chat" role="tabpanel" aria-labelledby="tab-chat" tabindex="0">
+        <div class="scroll-list" id="chat-list" role="log" aria-live="polite" aria-label="Chat messages"></div>
+        <form id="chat-form" class="panel-input">
+          <label for="chat-input" class="visually-hidden">Chat message</label>
+          <input id="chat-input" type="text" placeholder="Say something to the room" autocomplete="off">
+          <button type="submit">Send</button>
+        </form>
+      </div>
+
+      <div class="tab-panel hidden" id="panel-polls" role="tabpanel" aria-labelledby="tab-polls" tabindex="0">
+        <div class="scroll-list" id="poll-list" aria-live="polite" aria-label="Live polls"></div>
+        <details class="new-poll">
+          <summary>+ New poll</summary>
+          <form id="poll-form" class="panel-input stacked">
+            <label for="poll-question" class="visually-hidden">Poll question</label>
+            <input id="poll-question" type="text" placeholder="Question">
+            <label for="poll-options" class="visually-hidden">Poll options, comma separated</label>
+            <input id="poll-options" type="text" placeholder="Options, comma separated">
+            <button type="submit">Launch poll</button>
+          </form>
+        </details>
+      </div>
+
+      <div class="tab-panel hidden" id="panel-qa" role="tabpanel" aria-labelledby="tab-qa" tabindex="0">
+        <div class="scroll-list" id="qa-list" role="log" aria-live="polite" aria-label="Questions"></div>
+        <form id="qa-form" class="panel-input">
+          <label for="qa-input" class="visually-hidden">Ask a question</label>
+          <input id="qa-input" type="text" placeholder="Ask a question" autocomplete="off">
+          <button type="submit">Ask</button>
+        </form>
+      </div>
+
+      <div class="tab-panel hidden" id="panel-more" role="tabpanel" aria-labelledby="tab-more" tabindex="0">
+        <div class="scroll-list">
+
+          <div class="more-section">
+            <div class="more-title" id="whiteboard-label">Whiteboard</div>
+            <canvas id="whiteboard" width="288" height="180" role="img" aria-labelledby="whiteboard-label" aria-describedby="whiteboard-desc"></canvas>
+            <p id="whiteboard-desc" class="visually-hidden">A shared freehand drawing surface. Drawing on it is a visual, pointer-based activity with no non-visual equivalent — this canvas itself isn't operable by keyboard or screen reader, only the color and clear controls below are.</p>
+            <div class="wb-controls">
+              <label for="wb-color" class="visually-hidden">Whiteboard pen color</label>
+              <input type="color" id="wb-color" value="#3e8fff">
+              <button id="wb-clear" class="ghost-btn host-only">Clear</button>
+            </div>
+          </div>
+
+          <div class="more-section">
+            <div class="more-title">Raffle</div>
+            <div id="raffle-status" class="raffle-status" role="status" aria-live="polite">No entries yet</div>
+            <div class="raffle-buttons">
+              <button id="raffle-enter-btn" class="ghost-btn">Enter raffle</button>
+              <button id="raffle-draw-btn" class="ghost-btn host-only">Draw winner</button>
+            </div>
+          </div>
+
+          <div class="more-section host-only">
+            <div class="more-title" id="breakout-label">Breakout rooms</div>
+            <div id="breakout-status" class="raffle-status" role="status" aria-live="polite">Not active</div>
+            <div class="raffle-buttons">
+              <label for="breakout-count" class="visually-hidden">Number of breakout rooms</label>
+              <input id="breakout-count" type="number" min="1" max="200" value="2" style="width:60px" aria-describedby="breakout-label">
+              <button id="breakout-start-btn" class="ghost-btn">Start (5 min)</button>
+              <button id="breakout-end-btn" class="ghost-btn">End</button>
+            </div>
+          </div>
+
+          <div class="more-section host-only">
+            <div class="more-title" id="profile-label">Session profile</div>
+            <div class="wb-controls" style="flex-wrap:wrap; gap:8px;">
+              <label for="profile-title" class="visually-hidden">Session title</label>
+              <input id="profile-title" type="text" placeholder="Session title" style="flex:1; min-width:120px; background:var(--bg); border:1px solid var(--border); border-radius:3px; padding:8px; color:var(--text); font-size:12px;">
+            </div>
+            <div class="wb-controls" style="flex-wrap:wrap; gap:8px; margin-top:8px;">
+              <label for="profile-mode" class="visually-hidden">Intended delivery mode</label>
+              <select id="profile-mode" class="ghost-btn"></select>
+              <label for="profile-quality" class="visually-hidden">Intended video quality</label>
+              <select id="profile-quality" class="ghost-btn"></select>
+              <label for="profile-audio" class="visually-hidden">Intended audio format</label>
+              <select id="profile-audio" class="ghost-btn"></select>
+              <button id="profile-save-btn" class="ghost-btn">Save</button>
+            </div>
+            <div class="raffle-status" style="margin-top:8px;">Label only — doesn't open a real SDI/NDI/SRT pipeline (no broadcast hardware here).</div>
+          </div>
+
+        </div>
+      </div>
+    </aside>
+
+    <footer class="transport">
+      <button id="mic-btn" class="transport-btn active" aria-pressed="true">Mic</button>
+      <button id="cam-btn" class="transport-btn active" aria-pressed="true">Cam</button>
+      <button id="record-btn" class="transport-btn" aria-pressed="false">Record</button>
+      <div class="reaction-bar" role="group" aria-label="Send a reaction">
+        <button class="reaction-btn" data-emoji="👏" aria-label="React with applause">👏</button>
+        <button class="reaction-btn" data-emoji="❤️" aria-label="React with heart">❤️</button>
+        <button class="reaction-btn" data-emoji="😂" aria-label="React with laughter">😂</button>
+        <button class="reaction-btn" data-emoji="🎉" aria-label="React with celebration">🎉</button>
+        <button class="reaction-btn" data-emoji="✋" aria-label="Raise hand">✋</button>
+      </div>
+      <div class="transport-spacer"></div>
+      <button id="leave-btn" class="transport-btn danger">Leave</button>
+    </footer>
+  </div>
+
+  <div id="reaction-layer" aria-hidden="true"></div>
+  <div id="sr-announcer" class="visually-hidden" role="status" aria-live="polite"></div>
+
+  <script src="room.js"></script>
+</body>
+</html>
