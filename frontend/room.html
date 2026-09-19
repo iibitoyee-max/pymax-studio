@@ -14,6 +14,7 @@
 
   <div id="join-screen" class="join-screen">
     <div class="join-card">
+      <a href="/" class="back-link">← Back to home</a>
       <div class="tally"><span class="tally-dot" aria-hidden="true"></span>SIGNAL STANDBY</div>
       <h1>Enter the studio</h1>
       <label for="name-input">Your name</label>
@@ -22,8 +23,11 @@
       <input id="room-input" type="text" placeholder="q3-product-briefing">
       <label for="host-token-input">Host token <span class="optional-tag">(leave blank to join as attendee)</span></label>
       <input id="host-token-input" type="text" placeholder="Paste a host token, or claim one below">
+      <label for="passcode-input">Meeting passcode <span class="optional-tag">(only needed for scheduled meetings)</span></label>
+      <input id="passcode-input" type="text" placeholder="6-character passcode, if this room has one">
       <button id="join-btn">Go live</button>
       <button id="claim-host-btn" class="claim-host-btn" type="button">Claim host for this room</button>
+      <div id="join-error" class="claim-result hidden error" role="alert" aria-live="assertive"></div>
       <div id="claim-result" class="claim-result hidden" role="status" aria-live="polite"></div>
     </div>
   </div>
@@ -85,6 +89,25 @@
 
       <div class="tab-panel hidden" id="panel-more" role="tabpanel" aria-labelledby="tab-more" tabindex="0">
         <div class="scroll-list">
+
+          <div class="more-section">
+            <div class="more-title" id="meeting-info-label">Meeting info</div>
+            <div id="meeting-info-body">
+              <div class="info-row"><span class="info-label">Meeting ID</span><span class="info-value" id="info-meeting-id">—</span></div>
+              <div class="info-row" id="info-passcode-row">
+                <span class="info-label">Passcode</span><span class="info-value" id="info-passcode">—</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Join link</span>
+                <span class="info-value info-link" id="info-join-link">—</span>
+                <button id="copy-info-link-btn" class="ghost-btn" type="button">Copy</button>
+              </div>
+              <div id="info-qr-wrap" class="info-qr-wrap">
+                <div id="info-qr" aria-hidden="true"></div>
+                <p id="info-qr-fallback" class="visually-hidden">QR code unavailable in this environment — use the copyable link or meeting ID and passcode above instead.</p>
+              </div>
+            </div>
+          </div>
 
           <div class="more-section">
             <div class="more-title" id="whiteboard-label">Whiteboard</div>
@@ -158,6 +181,17 @@
   <div id="reaction-layer" aria-hidden="true"></div>
   <div id="sr-announcer" class="visually-hidden" role="status" aria-live="polite"></div>
 
+  <!--
+    QR code generation for the in-meeting "Meeting info" panel. This is a
+    real external dependency (like the Google Fonts link above), which
+    means it needs internet access to load — confirmed NOT reachable in
+    the sandbox this project was built in (a blocked CDN, verified
+    directly, not assumed). room.js checks `window.QRCode` before using
+    it and falls back to text-only sharing (link/ID/passcode, already
+    fully working either way) if this failed to load. Test on your own
+    network before relying on the QR feature specifically.
+  -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" onerror="window.__qrLoadFailed = true;"></script>
   <script src="room.js"></script>
 </body>
 </html>

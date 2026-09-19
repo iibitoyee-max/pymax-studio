@@ -13,6 +13,7 @@ const API = ""; // same-origin, Flask serves both API and this page
 const state = {
   roomId: null,
   peerId: null,
+  peerSecret: null,
   name: null,
   hostToken: null,
   isHost: false,
@@ -33,6 +34,7 @@ const params = new URLSearchParams(window.location.search);
 if (params.get("room")) document.getElementById("room-input").value = params.get("room");
 if (params.get("name")) document.getElementById("name-input").value = params.get("name");
 if (params.get("host_token")) document.getElementById("host-token-input").value = params.get("host_token");
+if (params.get("passcode")) document.getElementById("passcode-input").value = params.get("passcode");
 
 document.getElementById("claim-host-btn").addEventListener("click", async () => {
   const roomId = document.getElementById("room-input").value.trim();
@@ -67,11 +69,41 @@ document.getElementById("join-btn").addEventListener("click", async () => {
   const name = document.getElementById("name-input").value.trim();
   const roomId = document.getElementById("room-input").value.trim();
   const hostToken = document.getElementById("host-token-input").value.trim();
+  const passcode = document.getElementById("passcode-input").value.trim();
   if (!name || !roomId) return;
-  await enterStudio(roomId, name, hostToken || null);
+  await enterStudio(roomId, name, hostToken || null, passcode || null);
 });
 
-async function enterStudio(roomId, name, hostToken) {
+async function enterStudio(roomId, name, hostToken, passcode) {
+  const errorEl = document.getElementById("join-error");
+  errorEl.classList.add("hidden");
+
+  // Join first, before ever touching the camera/mic — no point prompting
+  // for media permissions if the passcode is wrong or the room rejects
+  // the join for some other reason. This also fixes a real pre-existing
+  // gap: the previous version never checked whether the join call
+  // succeeded at all, so a rejected join (403/404/anything but 200)
+  // would silently try to proceed with an undefined peer_id.
+  let res, data;
+  try {
+    res = await fetch(`${API}/api/room/${roomId}/join`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, host_token: hostToken, passcode }),
+    });
+    data = await res.json();
+  } catch (e) {
+    errorEl.textContent = "Couldn't reach the server. Check your connection and try again.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+
+  if (!res.ok) {
+    errorEl.textContent = data.error || "Couldn't join that room.";
+    errorEl.classList.remove("hidden");
+    return;
+  }
+
   state.roomId = roomId;
   state.name = name;
   state.hostToken = hostToken;
@@ -85,13 +117,8 @@ async function enterStudio(roomId, name, hostToken) {
 
   addVideoTile("local", name + " (you)", state.localStream, true);
 
-  const res = await fetch(`${API}/api/room/${roomId}/join`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, host_token: hostToken }),
-  });
-  const data = await res.json();
   state.peerId = data.peer_id;
+  state.peerSecret = data.peer_secret;
   state.isHost = data.role === "host";
 
   if (state.isHost) {
@@ -115,6 +142,7 @@ async function enterStudio(roomId, name, hostToken) {
 
   startClock();
   refreshProfileDisplay();
+  loadMeetingInfo();
   pollSignaling();
   pollChat();
   pollPolls();
@@ -193,14 +221,16 @@ function sendSignal(to, type, payload) {
   fetch(`${API}/api/room/${state.roomId}/signal`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ to, from: state.peerId, type, payload }),
+    body: JSON.stringify({ to, from: state.peerId, from_secret: state.peerSecret, type, payload }),
   });
 }
 
 async function pollSignaling() {
   while (state.roomId) {
     try {
-      const res = await fetch(`${API}/api/room/${state.roomId}/signal/${state.peerId}`);
+      const res = await fetch(
+        `${API}/api/room/${state.roomId}/signal/${state.peerId}?secret=${encodeURIComponent(state.peerSecret)}`
+      );
       const messages = await res.json();
       for (const msg of messages) {
         if (msg.type === "peer-joined") {
@@ -491,7 +521,7 @@ document.getElementById("leave-btn").addEventListener("click", async () => {
   await fetch(`${API}/api/room/${state.roomId}/leave`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ peer_id: state.peerId }),
+    body: JSON.stringify({ peer_id: state.peerId, peer_secret: state.peerSecret }),
   });
   window.location.reload();
 });
@@ -563,6 +593,71 @@ async function pollProfile() {
   while (state.roomId) {
     await sleep(4000);
     refreshProfileDisplay();
+  }
+}
+
+// ---------------------------------------------------------------------
+// Meeting info — shareable during an ongoing meeting (Meeting ID,
+// passcode, join link, and a QR code when the library loaded — see
+// room.html's comment on why that's not guaranteed). Loaded once after
+// joining; this data doesn't change during a session, so no need to poll.
+// ---------------------------------------------------------------------
+
+async function loadMeetingInfo() {
+  try {
+    const res = await fetch(
+      `${API}/api/room/${state.roomId}/meeting-info/${state.peerId}?secret=${encodeURIComponent(state.peerSecret)}`
+    );
+    if (!res.ok) return;
+    const info = await res.json();
+
+    document.getElementById("info-meeting-id").textContent = info.meeting_id_display;
+    document.getElementById("info-join-link").textContent = info.join_link;
+
+    const passcodeRow = document.getElementById("info-passcode-row");
+    if (info.passcode) {
+      document.getElementById("info-passcode").textContent = info.passcode;
+      passcodeRow.classList.remove("hidden");
+    } else {
+      passcodeRow.classList.add("hidden");
+    }
+
+    document.getElementById("copy-info-link-btn").onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(info.join_link);
+        announce("Join link copied");
+      } catch (e) {
+        announce("Couldn't copy automatically — select the link text instead");
+      }
+    };
+
+    renderMeetingQr(info.join_link);
+  } catch (e) {
+    console.warn("meeting info fetch failed", e);
+  }
+}
+
+function renderMeetingQr(joinLink) {
+  const wrap = document.getElementById("info-qr-wrap");
+  const target = document.getElementById("info-qr");
+  // window.QRCode comes from the CDN script tag in room.html, which may
+  // not have loaded (no internet access, a blocked CDN, an offline
+  // deployment). Checking for it rather than assuming it's there is the
+  // whole point — the rest of the sharing panel (link/ID/passcode) works
+  // regardless, tested independently of this.
+  if (typeof QRCode === "undefined" || window.__qrLoadFailed) {
+    document.getElementById("info-qr-fallback").classList.remove("visually-hidden");
+    wrap.classList.remove("qr-visible");
+    return;
+  }
+  target.innerHTML = "";
+  try {
+    new QRCode(target, { text: joinLink, width: 140, height: 140 });
+    wrap.classList.add("qr-visible");
+  } catch (e) {
+    console.warn("QR generation failed", e);
+    document.getElementById("info-qr-fallback").classList.remove("visually-hidden");
+    wrap.classList.remove("qr-visible");
   }
 }
 
@@ -687,7 +782,9 @@ async function pollBreakout() {
 
   while (state.roomId) {
     try {
-      const res = await fetch(`${API}/api/room/${state.roomId}/breakout/${state.peerId}`);
+      const res = await fetch(
+        `${API}/api/room/${state.roomId}/breakout/${state.peerId}?secret=${encodeURIComponent(state.peerSecret)}`
+      );
       const data = await res.json();
       const el = document.getElementById("breakout-status");
       if (data.active) {

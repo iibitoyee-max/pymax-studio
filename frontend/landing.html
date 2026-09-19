@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PryMax Studio</title>
+<link rel="stylesheet" href="landing.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">PRYMAX <span>STUDIO</span></div>
+    <button id="admin-login-toggle" class="admin-link" type="button">Admin login</button>
+  </header>
+
+  <main class="hero">
+    <h1>Where do you want to go?</h1>
+    <p class="subtitle">Join a scheduled meeting, start one of your own, or go live.</p>
+
+    <div class="card-grid">
+
+      <section class="action-card" id="start-now-card">
+        <div class="card-icon" aria-hidden="true">▶</div>
+        <h2>Start Meeting Now</h2>
+        <p>Instantly create a meeting and enter it — share the info once you're in.</p>
+        <form id="start-now-form" class="card-form hidden">
+          <label for="start-now-name" class="visually-hidden">Your name</label>
+          <input id="start-now-name" type="text" placeholder="Your name" autocomplete="name" required>
+          <button type="submit">Start</button>
+          <div id="start-now-form-error" class="form-error hidden" role="alert"></div>
+        </form>
+        <button class="card-open-btn" data-target="start-now-form" type="button">Start now</button>
+      </section>
+
+      <section class="action-card" id="join-card">
+        <div class="card-icon" aria-hidden="true">→</div>
+        <h2>Join Meeting</h2>
+        <p>Enter a meeting ID and passcode to join.</p>
+        <form id="join-form" class="card-form hidden">
+          <label for="join-name" class="visually-hidden">Your name</label>
+          <input id="join-name" type="text" placeholder="Your name" autocomplete="name" required>
+          <label for="join-meeting-id" class="visually-hidden">Meeting ID</label>
+          <input id="join-meeting-id" type="text" placeholder="Meeting ID" inputmode="numeric" required>
+          <label for="join-passcode" class="visually-hidden">Passcode</label>
+          <input id="join-passcode" type="text" placeholder="Passcode" required>
+          <button type="submit">Join</button>
+          <div id="join-form-error" class="form-error hidden" role="alert"></div>
+        </form>
+        <button class="card-open-btn" data-target="join-form" type="button">Join a meeting</button>
+      </section>
+
+      <section class="action-card" id="schedule-card">
+        <div class="card-icon" aria-hidden="true">＋</div>
+        <h2>Schedule Meeting</h2>
+        <p>Create a new meeting with its own ID and passcode.</p>
+        <form id="schedule-form" class="card-form hidden">
+          <label for="schedule-name" class="visually-hidden">Your name</label>
+          <input id="schedule-name" type="text" placeholder="Your name" autocomplete="name" required>
+          <label for="schedule-title" class="visually-hidden">Meeting title (optional)</label>
+          <input id="schedule-title" type="text" placeholder="Meeting title (optional)">
+          <button type="submit">Schedule</button>
+          <div id="schedule-form-error" class="form-error hidden" role="alert"></div>
+        </form>
+        <button class="card-open-btn" data-target="schedule-form" type="button">Schedule a meeting</button>
+      </section>
+
+      <section class="action-card" id="stream-card">
+        <div class="card-icon" aria-hidden="true">◉</div>
+        <h2>Live Streaming</h2>
+        <p>Start a broadcast-labeled session with its own join link.</p>
+        <form id="stream-form" class="card-form hidden">
+          <label for="stream-name" class="visually-hidden">Your name</label>
+          <input id="stream-name" type="text" placeholder="Your name" autocomplete="name" required>
+          <label for="stream-title" class="visually-hidden">Stream title (optional)</label>
+          <input id="stream-title" type="text" placeholder="Stream title (optional)">
+          <button type="submit">Go live</button>
+          <div id="stream-form-error" class="form-error hidden" role="alert"></div>
+        </form>
+        <button class="card-open-btn" data-target="stream-form" type="button">Start streaming</button>
+      </section>
+
+    </div>
+
+    <div id="result-panel" class="result-panel hidden" role="status" aria-live="polite">
+      <div class="result-title" id="result-title"></div>
+      <div class="result-row">
+        <span class="result-label">Meeting ID</span>
+        <span class="result-value" id="result-meeting-id"></span>
+      </div>
+      <div class="result-row">
+        <span class="result-label">Passcode</span>
+        <span class="result-value" id="result-passcode"></span>
+      </div>
+      <div class="result-row">
+        <span class="result-label">Join link</span>
+        <span class="result-value result-link" id="result-link"></span>
+        <button id="copy-link-btn" class="ghost-btn" type="button">Copy</button>
+      </div>
+      <button id="enter-now-btn" class="enter-now-btn" type="button">Enter now →</button>
+    </div>
+  </main>
+
+  <div id="admin-login-panel" class="admin-panel hidden">
+    <div class="admin-panel-card">
+      <button id="admin-panel-close" class="admin-panel-close" type="button" aria-label="Close admin login">×</button>
+      <h2>Admin login</h2>
+      <p class="admin-note">This signs you in as the host of your personal room. Not a general account system — see the project README for what that means.</p>
+      <form id="admin-login-form">
+        <label for="admin-username">Username</label>
+        <input id="admin-username" type="text" autocomplete="username" required>
+        <label for="admin-room">Room</label>
+        <input id="admin-room" type="text" autocomplete="off" required>
+        <button type="submit">Log in</button>
+        <div id="admin-login-error" class="form-error hidden" role="alert"></div>
+      </form>
+    </div>
+  </div>
+
+  <div id="sr-announcer" class="visually-hidden" role="status" aria-live="polite"></div>
+
+  <script src="landing.js"></script>
+</body>
+</html>

@@ -150,6 +150,8 @@ def load_room(room_id: str, created_at: float) -> dict:
         return {
             "host_token_hash": room_row["host_token_hash"],
             "host_token_expires_at": room_row["host_token_expires_at"],
+            "meeting_passcode": room_row["meeting_passcode"],
+            "meeting_type": room_row["meeting_type"],
             "profile": {
                 "title": room_row["profile_title"],
                 "mode": room_row["profile_mode"],
@@ -163,6 +165,19 @@ def load_room(room_id: str, created_at: float) -> dict:
             "raffle_entries": json.loads(room_row["raffle_entries_json"]),
             "raffle_winner": room_row["raffle_winner"],
         }
+
+
+def save_meeting_details(room_id: str, passcode: str | None, meeting_type: str | None) -> None:
+    """Passcode is stored in plain text deliberately, not hashed — it's
+    meant to be handed out in the join link/invite, the same sensitivity
+    level as the room ID itself, not a secret like a host token. See the
+    README's security section for the reasoning."""
+    with _db_lock, _conn:
+        _conn.execute(
+            "UPDATE rooms SET meeting_passcode = ?, meeting_type = ? WHERE room_id = ?",
+            (passcode, meeting_type, room_id),
+        )
+        _touch_room_activity(room_id)
 
 
 def save_host_token_hash(room_id: str, token_hash: str, expires_at: float | None) -> None:

@@ -212,6 +212,58 @@ describe("PryMax Studio room client (real browser)", () => {
     );
   });
 
+  test("meeting info panel shows the real meeting id, passcode, and join link", async () => {
+    const scheduleRes = await page.request.post(`${BASE_URL}/api/meetings/schedule`, {
+      data: { name: "Tester", title: "Info Panel Test" },
+    });
+    const meeting = await scheduleRes.json();
+
+    await page.goto(
+      `${BASE_URL}/room?room=${meeting.meeting_id}&name=Tester&host_token=${meeting.host_token}`
+    );
+    await page.click("#join-btn");
+    await page.waitForSelector("#studio:not(.hidden)");
+    await page.click("#tab-more");
+
+    await page.waitForFunction(
+      () => document.getElementById("info-meeting-id").textContent !== "—"
+    );
+    const displayedLink = await page.textContent("#info-join-link");
+    assert.ok(displayedLink.includes(meeting.meeting_id));
+    assert.ok(displayedLink.includes(meeting.passcode));
+    const displayedPasscode = await page.textContent("#info-passcode");
+    assert.equal(displayedPasscode, meeting.passcode);
+  });
+
+  test("meeting info gracefully falls back when the QR library isn't available", async () => {
+    const scheduleRes = await page.request.post(`${BASE_URL}/api/meetings/schedule`, {
+      data: { name: "Tester2" },
+    });
+    const meeting = await scheduleRes.json();
+
+    await page.goto(
+      `${BASE_URL}/room?room=${meeting.meeting_id}&name=Tester2&host_token=${meeting.host_token}`
+    );
+    await page.click("#join-btn");
+    await page.waitForSelector("#studio:not(.hidden)");
+    await page.click("#tab-more");
+    await page.waitForFunction(
+      () => document.getElementById("info-meeting-id").textContent !== "—"
+    );
+
+    // This sandbox's CDN is blocked, so this specifically verifies the
+    // fallback path (not the QR-success path, which needs real internet
+    // access this environment doesn't have — see room.html's comment).
+    const qrVisible = await page.evaluate(() =>
+      document.getElementById("info-qr-wrap").classList.contains("qr-visible")
+    );
+    const fallbackShown = await page.evaluate(
+      () => !document.getElementById("info-qr-fallback").classList.contains("visually-hidden")
+    );
+    assert.equal(qrVisible, false);
+    assert.equal(fallbackShown, true);
+  });
+
   test("host claim flow: claiming shows a token and joining with it reveals host controls", async () => {
     const room = uniqueRoom("hosttest");
     await page.goto(`${BASE_URL}/room`);

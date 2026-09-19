@@ -122,6 +122,21 @@ def _log_uncaught_exception(e):
 # experience end to end.
 # ---------------------------------------------------------------------------
 
+@app.get("/")
+def landing_page():
+    return send_from_directory(FRONTEND_DIR, "landing.html")
+
+
+@app.get("/landing.js")
+def landing_js():
+    return send_from_directory(FRONTEND_DIR, "landing.js")
+
+
+@app.get("/landing.css")
+def landing_css():
+    return send_from_directory(FRONTEND_DIR, "landing.css")
+
+
 @app.get("/room")
 def room_page():
     return send_from_directory(FRONTEND_DIR, "room.html")
@@ -164,6 +179,21 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _check_peer(room: "Room", peer_id: str, secret: str | None) -> bool:
+    """Constant-time check that `secret` proves ownership of `peer_id` in
+    this room. Added after a live test confirmed a real vulnerability:
+    /peers exposes every peer_id to every other room member, and /leave
+    and /signal originally trusted a bare peer_id with no proof at all —
+    letting any attendee forcibly disconnect any other peer, spoof
+    signaling messages as someone else, or read messages meant only for
+    another peer's inbox. See the README's security section for the full
+    writeup, including the live reproduction that found this."""
+    info = room.peers.get(peer_id)
+    if not info or not secret:
+        return False
+    return hmac.compare_digest(_hash_token(secret), info.get("secret_hash", ""))
+
+
 # How long a claimed host token stays valid. Configurable, since "right"
 # depends on deployment (a single webinar vs. a week-long virtual event).
 # 0 or negative disables expiry entirely (token valid until revoked or
@@ -183,6 +213,153 @@ def _check_host(room: "Room", token: str | None) -> bool:
     if room.host_token_expires_at is not None and time.time() >= room.host_token_expires_at:
         return False
     return hmac.compare_digest(_hash_token(token), room.host_token_hash)
+
+
+def _issue_host_token(room: "Room", room_id: str) -> tuple[str, float | None]:
+    """Generates a fresh host token, hashes it, stores it (in memory and
+    durably), and returns (raw_token, expires_at). Shared by /host/claim
+    (which only calls this when the room has no host yet) and admin login
+    (which calls this unconditionally, deliberately overwriting any
+    existing host claim on that one specific admin-owned room — a
+    repeatable login, not a claim-once flow)."""
+    token = secrets.token_urlsafe(24)
+    expires_at = time.time() + HOST_TOKEN_TTL_SECONDS if HOST_TOKEN_TTL_SECONDS > 0 else None
+    room.host_token_hash = _hash_token(token)
+    room.host_token_expires_at = expires_at
+    store.save_host_token_hash(room_id, room.host_token_hash, expires_at)
+    return token, expires_at
+
+
+# ---------------------------------------------------------------------------
+# Admin login — a fixed, single-account convenience login, NOT a general
+# user-account system. Configurable via env vars so the literal values
+# aren't force-hardcoded for every deployment, but the defaults match
+# what was asked for. IMPORTANT, stated plainly rather than glossed over:
+# this is a simple exact-string-match credential pair with no password
+# hashing, no rate-limit-proof brute-force resistance beyond the rate
+# limit below, and no real account system behind it. It's a convenience
+# mechanism suitable for a single-operator demo/personal deployment —
+# see the README's security section for what a real multi-admin system
+# would need instead.
+# ---------------------------------------------------------------------------
+
+ADMIN_USERNAME = os.environ.get("PRYMAX_ADMIN_USERNAME", "Ibitoye")
+ADMIN_ROOM = os.environ.get("PRYMAX_ADMIN_ROOM", "Superroom")
+
+
+@app.post("/api/admin/login")
+@rate_limit("admin_login", limit=5, window_seconds=60)
+def admin_login():
+    body = request.get_json(force=True, silent=True) or {}
+    username = (body.get("username") or "").strip()
+    room_name = (body.get("room") or "").strip()
+
+    valid = hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(
+        room_name, ADMIN_ROOM
+    )
+    if not valid:
+        log_warning(logger, "admin login failed", request_id=getattr(request, "request_id", None))
+        return _err("invalid admin credentials", 401)
+
+    with _lock:
+        room = _get_room(ADMIN_ROOM)
+        token, expires_at = _issue_host_token(room, ADMIN_ROOM)
+
+    log_event(logger, "admin login succeeded", room_id=ADMIN_ROOM, request_id=getattr(request, "request_id", None))
+    return jsonify(
+        {
+            "host_token": token,
+            "expires_at": expires_at,
+            "room_id": ADMIN_ROOM,
+            "role": "admin",
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scheduled meetings & live streams — generates a Meeting ID (used
+# directly as the room_id) and a Passcode, from the landing page's
+# "Schedule Meeting" / "Live Streaming" buttons. The scheduler
+# automatically becomes host of the new meeting. A live stream is the
+# same mechanism with meeting_type="stream" and the session profile's
+# mode pre-set to a broadcast-flavored label (still just a label — see
+# the Session Profile comment above; this does not open a real RTMP/SRT
+# pipeline).
+# ---------------------------------------------------------------------------
+
+def _generate_meeting_id() -> str:
+    """An 11-digit numeric id, Zoom-style, used directly as the room_id
+    (matches _ROOM_ID_RE — digits only, no spaces). Retries on the
+    astronomically unlikely chance of a collision with an existing room."""
+    for _ in range(10):
+        candidate = "".join(secrets.choice("0123456789") for _ in range(11))
+        if candidate not in _rooms:
+            return candidate
+    raise RuntimeError("could not generate a unique meeting id")
+
+
+def _generate_passcode() -> str:
+    """A 6-character passcode, uppercase letters + digits, excluding
+    visually ambiguous characters (0/O, 1/I) for readability when typed
+    in by hand from a shared invite."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+def _format_meeting_id(meeting_id: str) -> str:
+    """Display-only grouping, e.g. "123 4567 8901" — never used as the
+    actual room_id/URL value, which stays the plain digit string. Only
+    applies to real generated 11-digit meeting ids; an ad-hoc room name
+    (e.g. someone typed "team-standup" directly) is returned unchanged
+    rather than being sliced into nonsense."""
+    if len(meeting_id) == 11 and meeting_id.isdigit():
+        return f"{meeting_id[:3]} {meeting_id[3:7]} {meeting_id[7:]}"
+    return meeting_id
+
+
+@app.post("/api/meetings/schedule")
+@rate_limit("schedule_meeting", limit=20, window_seconds=60)
+def schedule_meeting():
+    body = request.get_json(force=True, silent=True) or {}
+    name, err = _clean_str(body.get("name"), 100, "name")
+    if err:
+        return err
+    title = (body.get("title") or "").strip()[:200] or None
+    meeting_type = body.get("type") if body.get("type") in ("meeting", "stream") else "meeting"
+
+    with _lock:
+        meeting_id = _generate_meeting_id()
+        passcode = _generate_passcode()
+        room = _get_room(meeting_id)
+        token, expires_at = _issue_host_token(room, meeting_id)
+        room.meeting_passcode = passcode
+        room.meeting_type = meeting_type
+        store.save_meeting_details(meeting_id, passcode, meeting_type)
+        if title:
+            room.profile["title"] = title
+        if meeting_type == "stream":
+            room.profile["mode"] = BroadcastMode.RTMP.value
+        store.save_profile(meeting_id, room.profile)
+
+    join_link = f"{request.host_url.rstrip('/')}/room?room={meeting_id}&passcode={passcode}"
+    log_event(
+        logger,
+        "meeting scheduled",
+        room_id=meeting_id,
+        meeting_type=meeting_type,
+        request_id=getattr(request, "request_id", None),
+    )
+    return jsonify(
+        {
+            "meeting_id": meeting_id,
+            "meeting_id_display": _format_meeting_id(meeting_id),
+            "passcode": passcode,
+            "host_token": token,
+            "expires_at": expires_at,
+            "join_link": join_link,
+            "type": meeting_type,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +413,8 @@ class Room:
     breakout: dict | None = None  # {count, duration_seconds, started_at, groups: [[peer_id,...]]}
     host_token_hash: str | None = None  # SHA-256 hex digest; the raw token is only ever returned once, from /host/claim
     host_token_expires_at: float | None = None  # None = never expires (see HOST_TOKEN_TTL_SECONDS)
+    meeting_passcode: str | None = None  # plain text, see store.save_meeting_details' docstring for why
+    meeting_type: str | None = None  # "meeting" | "stream" | None (an ad-hoc/legacy room)
     profile: dict = field(
         default_factory=lambda: {
             "title": None,
@@ -256,6 +435,8 @@ def _get_room(room_id: str) -> Room:
         durable = store.load_room(room_id, room.created_at)
         room.host_token_hash = durable["host_token_hash"]
         room.host_token_expires_at = durable["host_token_expires_at"]
+        room.meeting_passcode = durable["meeting_passcode"]
+        room.meeting_type = durable["meeting_type"]
         room.profile = durable["profile"]
         room.chat = durable["chat"]
         room.polls = durable["polls"]
@@ -316,11 +497,30 @@ def join_room(room_id: str):
         return err
     host_token = body.get("host_token")
 
+    room = _get_room(room_id)
+    is_host = _check_host(room, host_token)
+
+    # A room created via "Schedule Meeting" / "Live Streaming" has a
+    # passcode gate — enforced here, at the actual join point, not just
+    # as a separate pre-check screen, so it can't be bypassed by calling
+    # this endpoint directly. The host bypasses it (proven via host_token
+    # above), matching how a meeting organizer doesn't need their own
+    # meeting's passcode to (re)join it.
+    if room.meeting_passcode and not is_host:
+        supplied = (body.get("passcode") or "").strip()
+        if not supplied or not hmac.compare_digest(supplied, room.meeting_passcode):
+            return _err("meeting passcode required or incorrect", 403)
+
     peer_id = uuid.uuid4().hex[:12]
+    peer_secret = secrets.token_urlsafe(24)
     with _lock:
-        room = _get_room(room_id)
-        role = "host" if _check_host(room, host_token) else "attendee"
-        room.peers[peer_id] = {"name": name, "joined_at": time.time(), "role": role}
+        role = "host" if is_host else "attendee"
+        room.peers[peer_id] = {
+            "name": name,
+            "joined_at": time.time(),
+            "role": role,
+            "secret_hash": _hash_token(peer_secret),
+        }
         # Tell every *existing* peer that a new peer arrived, so they can
         # initiate an offer to it (simple mesh, new joiner is the answerer).
         existing_peers = [
@@ -333,16 +533,55 @@ def join_room(room_id: str):
                 {"type": "peer-joined", "from": peer_id, "name": name}
             )
 
-    return jsonify({"peer_id": peer_id, "role": role, "existing_peers": existing_peers})
+    return jsonify(
+        {"peer_id": peer_id, "peer_secret": peer_secret, "role": role, "existing_peers": existing_peers}
+    )
+
+
+@app.post("/api/meetings/verify")
+@rate_limit("verify_meeting", limit=20, window_seconds=60)
+def verify_meeting():
+    """Lets the landing page's 'Join Meeting' form check a meeting id +
+    passcode before navigating to the room, for a better error message
+    than 'joined the room, then immediately got bounced'. This is a
+    convenience pre-check only — the actual, un-bypassable enforcement
+    lives in join_room() above, which checks the passcode again
+    regardless of what this endpoint says."""
+    body = request.get_json(force=True, silent=True) or {}
+    meeting_id = (body.get("meeting_id") or "").strip().replace(" ", "")
+    passcode = (body.get("passcode") or "").strip()
+
+    if not _ROOM_ID_RE.match(meeting_id):
+        return _err("invalid meeting id")
+
+    room = _get_room(meeting_id)
+    if room.meeting_passcode is None and room.host_token_hash is None:
+        # Never scheduled/claimed — nothing to join yet, rather than
+        # silently creating an empty phantom room and calling it valid.
+        return _err("no meeting found with that id", 404)
+    if room.meeting_passcode and not hmac.compare_digest(passcode, room.meeting_passcode):
+        return _err("incorrect passcode", 403)
+
+    return jsonify(
+        {
+            "valid": True,
+            "meeting_id": meeting_id,
+            "title": room.profile.get("title"),
+            "type": room.meeting_type or "meeting",
+        }
+    )
 
 
 @app.post("/api/room/<room_id>/leave")
+@rate_limit("leave", limit=20, window_seconds=60)
 def leave_room(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     peer_id = body.get("peer_id")
+    room = _get_room(room_id)
+    if not peer_id or not _check_peer(room, peer_id, body.get("peer_secret")):
+        return _err("peer authentication required", 403)
     with _lock:
-        room = _rooms.get(room_id)
-        if room and peer_id in room.peers:
+        if peer_id in room.peers:
             del room.peers[peer_id]
             room.signal_queues.pop(peer_id, None)
             for pid in room.peers:
@@ -377,23 +616,19 @@ def claim_host(room_id: str):
         room = _get_room(room_id)
         if room.host_token_hash is not None:
             return _err("this room already has a host", 409)
-        token = secrets.token_urlsafe(24)
-        room.host_token_hash = _hash_token(token)
-        room.host_token_expires_at = (
-            time.time() + HOST_TOKEN_TTL_SECONDS if HOST_TOKEN_TTL_SECONDS > 0 else None
-        )
-        store.save_host_token_hash(room_id, room.host_token_hash, room.host_token_expires_at)
+        token, expires_at = _issue_host_token(room, room_id)
     log_event(
         logger,
         "host claimed",
         room_id=room_id,
-        expires_at=room.host_token_expires_at,
+        expires_at=expires_at,
         request_id=getattr(request, "request_id", None),
     )
-    return jsonify({"host_token": token, "expires_at": room.host_token_expires_at})
+    return jsonify({"host_token": token, "expires_at": expires_at})
 
 
 @app.post("/api/room/<room_id>/host/revoke")
+@rate_limit("host_revoke", limit=10, window_seconds=60)
 def revoke_host(room_id: str):
     """Lets the current, still-valid host invalidate their own token —
     real revocation, not just waiting for expiry. Requires the current
@@ -413,6 +648,7 @@ def revoke_host(room_id: str):
 
 
 @app.post("/api/room/<room_id>/host/verify")
+@rate_limit("host_verify", limit=30, window_seconds=60)
 def verify_host(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -431,6 +667,7 @@ def get_profile(room_id: str):
 
 
 @app.put("/api/room/<room_id>/profile")
+@rate_limit("profile_set", limit=10, window_seconds=60)
 def set_profile(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -473,6 +710,7 @@ def send_signal(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     to_peer = body.get("to")
     from_peer = body.get("from")
+    from_secret = body.get("from_secret")
     msg_type = body.get("type")  # "offer" | "answer" | "ice-candidate"
     payload = body.get("payload")
 
@@ -481,6 +719,8 @@ def send_signal(room_id: str):
 
     with _lock:
         room = _get_room(room_id)
+        if not _check_peer(room, from_peer, from_secret):
+            return _err("sender authentication required", 403)
         if to_peer not in room.peers:
             return _err("target peer not in room", 404)
         room.signal_queues[to_peer].append(
@@ -491,8 +731,11 @@ def send_signal(room_id: str):
 
 @app.get("/api/room/<room_id>/signal/<peer_id>")
 def poll_signal(room_id: str, peer_id: str):
+    secret = request.args.get("secret")
     with _lock:
         room = _get_room(room_id)
+        if not _check_peer(room, peer_id, secret):
+            return _err("peer authentication required", 403)
         messages = room.signal_queues.get(peer_id, [])
         room.signal_queues[peer_id] = []
     return jsonify(messages)
@@ -589,6 +832,7 @@ def vote_poll(room_id: str, poll_id: int):
 
 
 @app.post("/api/room/<room_id>/poll/<int:poll_id>/close")
+@rate_limit("poll_close", limit=20, window_seconds=60)
 def close_poll(room_id: str, poll_id: int):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -659,6 +903,7 @@ def upvote_question(room_id: str, qid: int):
 
 
 @app.post("/api/room/<room_id>/qa/<int:qid>/answered")
+@rate_limit("qa_answered", limit=20, window_seconds=60)
 def mark_answered(room_id: str, qid: int):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -731,6 +976,7 @@ def raffle_enter(room_id: str):
 
 
 @app.post("/api/room/<room_id>/raffle/draw")
+@rate_limit("raffle_draw", limit=10, window_seconds=60)
 def raffle_draw(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -753,6 +999,7 @@ def raffle_draw(room_id: str):
 
 
 @app.post("/api/room/<room_id>/raffle/reset")
+@rate_limit("raffle_reset", limit=10, window_seconds=60)
 def raffle_reset(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -819,6 +1066,7 @@ def get_strokes(room_id: str):
 
 
 @app.post("/api/room/<room_id>/whiteboard/clear")
+@rate_limit("whiteboard_clear", limit=10, window_seconds=60)
 def clear_whiteboard(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -875,6 +1123,7 @@ def start_breakout(room_id: str):
 
 
 @app.post("/api/room/<room_id>/breakout/end")
+@rate_limit("breakout_end", limit=10, window_seconds=60)
 def end_breakout(room_id: str):
     body = request.get_json(force=True, silent=True) or {}
     room = _get_room(room_id)
@@ -887,7 +1136,10 @@ def end_breakout(room_id: str):
 
 @app.get("/api/room/<room_id>/breakout/<peer_id>")
 def get_breakout_assignment(room_id: str, peer_id: str):
+    secret = request.args.get("secret")
     room = _get_room(room_id)
+    if not _check_peer(room, peer_id, secret):
+        return _err("peer authentication required", 403)
     bo = room.breakout
     if not bo:
         return jsonify({"active": False})
@@ -911,6 +1163,38 @@ def get_breakout_assignment(room_id: str, peer_id: str):
             "group_index": group_index,
             "breakout_room_id": f"{room_id}::bo{group_index}",
             "seconds_remaining": int(remaining),
+        }
+    )
+
+
+@app.get("/api/room/<room_id>/meeting-info/<peer_id>")
+def get_meeting_info(room_id: str, peer_id: str):
+    """Meeting ID, passcode, and a shareable join link for a room already
+    in progress — so a host or attendee can invite more people without
+    leaving the meeting. Gated the same way as the signaling/breakout
+    endpoints: only someone who has actually joined this room (proven via
+    their peer_secret) can fetch it. That's a deliberate choice, not the
+    only reasonable one — see the README's security section for the
+    tradeoff (anyone already in counts as trusted enough to invite more
+    people; a stricter host-only version would be a one-line change to
+    check _check_host instead)."""
+    secret = request.args.get("secret")
+    room = _get_room(room_id)
+    if not _check_peer(room, peer_id, secret):
+        return _err("peer authentication required", 403)
+
+    join_link = f"{request.host_url.rstrip('/')}/room?room={room_id}"
+    if room.meeting_passcode:
+        join_link += f"&passcode={room.meeting_passcode}"
+
+    return jsonify(
+        {
+            "meeting_id": room_id,
+            "meeting_id_display": _format_meeting_id(room_id),
+            "passcode": room.meeting_passcode,
+            "join_link": join_link,
+            "title": room.profile.get("title"),
+            "type": room.meeting_type or "meeting",
         }
     )
 

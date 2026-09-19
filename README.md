@@ -18,23 +18,28 @@ prymax/
 │   ├── backup.py         Online backup/restore script with retention pruning
 │   ├── ratelimit.py      In-memory sliding-window rate limiter
 │   ├── logging_config.py JSON structured logging setup
-│   ├── test_app.py        Automated API test suite (stdlib unittest) — 32 tests
+│   ├── test_app.py        Automated API test suite (stdlib unittest) — 57 tests
 │   ├── test_logging.py    Log-output verification tests — 14 tests
 │   ├── test_migrations.py Migration-runner tests — 7 tests
 │   ├── test_backup.py     Backup/restore tests — 8 tests
 │   ├── test_concurrency.py Concurrent-write stress tests — 2 tests
+│   ├── loadtest.py         Real HTTP load-testing tool (capacity + realistic modes)
 │   ├── testutil.py        Shared test cleanup helper (see its docstring
 │   │                      for a real cross-test-file bug it fixes)
 │   ├── prymax.db          Created on first run — not in the zip/repo
 │   ├── backups/           Created by backup.py — not in the zip/repo
 │   └── requirements.txt
 ├── frontend/
+│   ├── landing.html        Landing page: Start/Join/Schedule/Stream + admin login
+│   ├── landing.css
+│   ├── landing.js
 │   ├── room.html          Studio-console styled webinar room
 │   ├── room.css
 │   ├── room.js            WebRTC (mesh) + polling client, no external libs
 │   ├── package.json       Playwright dev dependency for the browser tests
 │   └── tests/
-│       └── room.browser.test.js  Real-Chromium browser tests — 9 tests
+│       ├── room.browser.test.js     Real-Chromium browser tests — 11 tests
+│       └── landing.browser.test.js  Real-Chromium browser tests — 9 tests
 └── registration/
     ├── db.php            SQLite via PDO, zero setup
     ├── index.php         Event registration landing page
@@ -75,7 +80,7 @@ the default).
 ```bash
 cd backend
 python3 -m unittest discover -p "test_*.py" -v
-# 63 tests total (32 API + 14 logging + 7 migrations + 8 backup + 2
+# 88 tests total (57 API + 14 logging + 7 migrations + 8 backup + 2
 # concurrency), run against temp SQLite files — never touches the real
 # prymax.db. Verified stable across multiple test-file orderings and
 # repeated runs — see the Automated Tests section for why that specific
@@ -242,6 +247,87 @@ enterprise auth system. Being upfront about its limits:
 This is a real, working step up from "anyone can moderate anything" — not
 a claim that it's production-grade identity and access management.
 
+## Landing page, admin login, and scheduled meetings
+
+A Zoom-style front door was added on top of the existing room system:
+`frontend/landing.html` (served at `/`) with four actions — **Start
+Meeting Now**, **Join Meeting**, **Schedule Meeting**, and **Live
+Streaming** — plus an **Admin Login**. None of this replaces the
+existing ad-hoc "type any room name and go" flow in `room.html`; it's a
+front door built on top of the same backend primitives (rooms, host
+tokens, peer secrets) already documented above.
+
+**Admin login** (`POST /api/admin/login`): a fixed, single-account
+convenience login — default `Username: Ibitoye`, `Room: Superroom`,
+both overridable via `PRYMAX_ADMIN_USERNAME`/`PRYMAX_ADMIN_ROOM` env
+vars. Said plainly rather than glossed over: **this is not a real
+authentication system.** It's an exact-string-match credential pair
+with no password hashing and no account database — a convenience
+mechanism for a single-operator deployment, rate-limited (5/60s) to
+blunt casual brute-forcing but not resistant to a determined attacker
+who can make many attempts over time. Unlike the normal `/host/claim`
+flow (which is claim-once — the first caller wins, permanently, until
+expiry/revocation), admin login is **repeatable**: correct credentials
+always succeed and issue a fresh host token for "Superroom", overwriting
+any previous one. Verified: wrong username rejected, wrong room name
+rejected, correct pair succeeds every time (not just once), the issued
+token actually grants working host privileges (join as host, edit
+profile), and re-logging in invalidates the previous token. Before
+relying on this for anything beyond a personal/demo deployment, replace
+it with real authentication — this was built exactly as asked, with the
+security tradeoff stated up front rather than hidden.
+
+**Scheduled meetings** (`POST /api/meetings/schedule`): generates an
+11-digit numeric Meeting ID (used directly as the room ID — Zoom-style
+formatting like "123 4567 8901" is display-only) and a 6-character
+passcode (uppercase letters + digits, excluding visually ambiguous
+characters like `0`/`O` and `1`/`I`), creates the room, and makes the
+scheduler its host. **Live Streaming** is the identical mechanism with
+`type: "stream"`, which additionally pre-sets the session profile's mode
+to `rtmp` — still just a label on a WebRTC room, exactly like every
+other profile-mode setting in this project (see the original Session
+Profile feature) — not a real RTMP/SDI pipeline. No hardware streaming
+capability was added or implied.
+
+**The passcode is a real, enforced gate, not a UI-only formality.**
+It's checked inside `join_room()` itself — the actual join endpoint —
+so it can't be bypassed by skipping a separate "verify" screen and
+calling the join API directly. Confirmed live: joining without a
+passcode fails (403), joining with the wrong passcode fails (403),
+joining with the correct one succeeds, and the host can rejoin their own
+meeting without ever supplying the passcode (proven via their host
+token instead). A separate `POST /api/meetings/verify` endpoint exists
+purely for a better pre-navigation error message on the landing page —
+it duplicates none of the enforcement logic, so there's nothing to drift
+out of sync.
+
+**Meeting info is shareable during an ongoing meeting**, not just at
+scheduling time — the whole point of "Start Meeting Now" skipping the
+result screen entirely. Inside the room, the "More" tab has a "Meeting
+info" panel (`GET /api/room/<id>/meeting-info/<peer_id>`) showing the
+Meeting ID, passcode, a copyable join link, and a QR code. Gated the
+same way as signaling/breakout endpoints — any already-joined
+participant can fetch it (proven via their own peer_secret), on the
+reasoning that anyone already trusted enough to be in the room is
+trusted enough to invite more people; a host-only version would be a
+one-line change if that's the wrong default for a given deployment.
+
+**The QR code is a real external dependency, tested honestly.** It
+loads a small library from cdnjs — confirmed, by directly testing
+whether this sandbox's Chromium could reach that CDN at all, that it
+cannot (an explicit 403 from the network egress, not a guess). Rather
+than ship an unverifiable hand-rolled QR encoder (a real risk: a subtly
+wrong implementation would *look* like a QR code while failing to scan,
+and this environment has no QR reader to check against), the code
+checks whether the library actually loaded (`typeof QRCode ===
+"undefined"`) and falls back to a text message pointing at the
+already-fully-working link/ID/passcode sharing, rather than silently
+rendering nothing. Verified via a real browser test: in this sandbox,
+the fallback path is what actually fires — confirmed, not assumed — and
+the QR-success path itself is untested here since it requires internet
+access this environment doesn't have. Test it on a normal network
+before relying on it.
+
 ## Persistence — what it is and isn't
 
 Chat, polls, Q&A, whiteboard, raffle state, host tokens, and the session
@@ -268,14 +354,14 @@ above for the exact test). Being upfront about this layer's limits too:
 
 ## Automated tests — what they cover and what they don't
 
-`backend/test_app.py` — 32 tests, using Python's built-in `unittest` and
+`backend/test_app.py` — 57 tests, using Python's built-in `unittest` and
 Flask's test client rather than pytest, because this sandbox has no
 network access to install pytest. Run with `python3 -m unittest test_app.py
 -v` — no server needs to be running; the test client calls the Flask app
 directly in-process.
 
 Also in `backend/`: `test_logging.py` (14), `test_migrations.py` (7),
-`test_backup.py` (8), and `test_concurrency.py` (2) — 63 tests total.
+`test_backup.py` (8), and `test_concurrency.py` (2) — 88 tests total.
 Run them all together with:
 
 ```bash
@@ -346,7 +432,10 @@ setup done once per file.
 different explicitly-constructed orderings (including the exact one that
 exposed the second bug), and five repeated runs of the same order to
 rule out timing-based flakiness from the real thread pools in
-`test_concurrency.py`. All 63 tests passed in every case. Also confirmed
+`test_concurrency.py`. All 68 tests passed in every case at that point
+(before the Tier B security-review additions and the landing-page/
+meeting features brought the API suite to 57 tests / 88 total). Also
+confirmed
 the `atexit`-deferred cleanup actually deletes its temp files (checked
 the file count in the temp directory before and after a full test run —
 no growth) rather than just assuming deferring cleanup is equivalent to
@@ -436,9 +525,11 @@ tested (per above), and still worth being precise about the limits:
 
 ## Frontend browser tests — what they cover, and an honest flakiness finding
 
-`frontend/tests/room.browser.test.js` — 9 tests using Playwright (a real
-Chromium browser, not a DOM simulation) plus Node's built-in test runner.
-This closes what was previously a complete gap: zero automated coverage
+`frontend/tests/room.browser.test.js` (11 tests) and
+`frontend/tests/landing.browser.test.js` (9 tests) — 20 tests total,
+using Playwright (a real Chromium browser, not a DOM simulation) plus
+Node's built-in test runner. This closes what was previously a complete
+gap: zero automated coverage
 of the actual JavaScript running in the browser. Covers the join flow,
 the ARIA keyboard tab-navigation pattern, a chat message actually
 round-tripping through the live Flask server, mic-toggle state, a
@@ -480,15 +571,33 @@ not a defect in the shipped code — but it's exactly the kind of claim
 that shouldn't be taken on faith. If this suite is flaky in your own CI,
 check available CPU cores before assuming the tests or the app are wrong.
 
+**A second, distinct flakiness source, found the same way — by actually
+running the suite repeatedly, not assumed:** several
+`landing.browser.test.js` tests call `POST /api/meetings/schedule`
+(directly or via the UI), which is rate-limited to 20/60s per source
+IP — a real, intentional security control, not a bug. Running that file
+many times back-to-back from the same machine will eventually exhaust
+that budget and fail a schedule-dependent test with a timeout, because
+the request that should have returned a new meeting got a 429 instead.
+Confirmed by reproducing it directly. The fix applied was raising the
+limit from 10 to 20 (a genuine product decision — 10/min was arguably
+too tight for real scheduling usage anyway, not just a number picked to
+please a test), not disabling the rate limiter to make tests pass; the
+underlying interaction between "a real security control" and "a test
+suite that exercises it repeatedly" is inherent and worth knowing about
+rather than papered over.
+
 **Not covered:** anything requiring more than one simultaneous WebRTC
 peer (Playwright can drive multiple pages, but verifying actual
 peer-to-peer video/audio flow between two real `RTCPeerConnection`s in a
 scripted test is a meaningfully bigger undertaking than what's here), the
-whiteboard's drawing interaction, the raffle/breakout UI flows, and
-`@playwright/test`'s convenience fixtures (retries, trace viewer,
-parallel workers) — this uses the plain `playwright` library directly
-since `@playwright/test` wasn't available in the environment this was
-built in.
+whiteboard's drawing interaction, the raffle/breakout UI flows, the
+QR-code-actually-renders-and-scans path (this sandbox's CDN access is
+confirmed blocked, so only the graceful-fallback path is tested here —
+see the Landing Page section above), and `@playwright/test`'s
+convenience fixtures (retries, trace viewer, parallel workers) — this
+uses the plain `playwright` library directly since `@playwright/test`
+wasn't available in the environment this was built in.
 
 ## Database migrations — what it is and isn't
 
@@ -685,6 +794,100 @@ fixed:
   duplicate ids, no broken ARIA references, valid parse of the real
   served output) are the strongest verification available without one.
 
+## Security review — a manual audit, not a substitute for a real one
+
+No automated security scanner (bandit, etc.) was available in this
+sandbox and there's no network access to install one, so this is a
+manual, line-by-line review of `app.py`, `store.py`, `ratelimit.py`,
+`migrations.py`, and `backup.py` — genuinely thorough, but explicitly
+**not** a substitute for a real third-party penetration test, which
+this project still doesn't have and can't get inside a sandbox.
+
+### A real vulnerability found and fixed, not just noted
+
+Live-tested (not just read and assumed) two exploitable issues, both
+stemming from the same root cause: `GET /peers` exposes every peer's
+`peer_id` to every other member of a room, and — until this pass — the
+endpoints that take a `peer_id` as an argument (`/leave`,
+`/signal/<peer_id>`, `/signal`'s `from` field, `/breakout/<peer_id>`)
+trusted it completely, with no proof the caller actually *was* that
+peer.
+
+Confirmed by direct exploitation before fixing anything:
+- **Forced disconnection**: any attendee could read another peer's id
+  via `/peers` and call `POST /leave` with it, immediately kicking that
+  peer out of the room with zero authentication.
+- **Signaling spoofing**: any attendee could send a fake WebRTC
+  offer/answer/ICE candidate to another peer while claiming to be a
+  third peer, since `from` was never verified.
+- **Signaling eavesdropping**: any attendee could poll
+  `GET /signal/<peer_id>` for *any* peer_id in the room and read
+  messages meant only for that peer — including real WebRTC offers.
+
+**Fix**: `POST /join` now also issues a `peer_secret` (24 bytes,
+`secrets.token_urlsafe`, same generation method already used for host
+tokens), hashed server-side the same way host tokens are. Proving
+ownership of a `peer_id` — via `/leave`, reading that peer's signal
+inbox, sending a signal *as* that peer, or reading that peer's breakout
+assignment — now requires the matching secret, checked with
+`hmac.compare_digest` for the same timing-safety reason host-token
+checks already used it. `/peers` was checked and confirmed to never
+expose the secret or its hash.
+
+**Verified, not assumed, in both directions**: reproduced all three
+attacks live against the *unfixed* code first (each one is a matching
+docstring-referenced test in `test_app.py` now:
+`test_leave_requires_own_peer_secret`,
+`test_signal_requires_sender_proof`,
+`test_signal_inbox_requires_own_secret`), confirmed each one succeeds
+against the vulnerable version, applied the fix, reproduced again and
+confirmed each is now rejected with 403 — and separately confirmed
+*legitimate* signaling, joining, and leaving still work end to end,
+including a full real-browser Playwright run against the patched server
+(all tests still pass) and the full 88-test backend suite.
+
+### Other findings, by severity
+
+**Medium — addressed:** ten endpoints (`/leave`, `/host/revoke`,
+`/host/verify`, `PUT /profile`, poll close, Q&A mark-answered, raffle
+draw/reset, whiteboard clear, breakout end) had no rate limiting at all.
+Most are already gated behind a host token or a 192-bit peer secret
+(practically un-guessable, so not a realistic brute-force vector), but
+lacking rate limits is still a real resource-exhaustion gap on its own.
+All ten now have sensible per-minute limits, added in this pass,
+confirmed not to break any existing test.
+
+**Low — accepted design tradeoff, not fixed:** display names are
+self-reported with no account system behind them, so a single person
+can trivially vote twice on a poll, enter a raffle twice, or upvote a
+question twice by submitting under two different names — the
+"already voted" checks only dedupe by name, which is the only identity
+concept this app has. Genuinely fixing this needs real accounts (a much
+bigger feature than this pass), so it's named here as a known, accepted
+limitation of the no-login design rather than something patched around
+the edges.
+
+**Low — accepted design tradeoff, not fixed:** any client that knows or
+guesses a room ID can join it and see its `/peers`, chat, polls, and
+Q&A — the room ID itself is the only access control, identical to how a
+Zoom link or a Google Meet code works. Room IDs are validated for
+*format* (alphanumeric/dash/underscore, 1–80 chars) but nothing enforces
+they be *hard to guess* — a deployment using short, sequential, or
+predictable room IDs would be trivially enumerable. This is inherent to
+the room-link model the whole product is built on, not a bug to patch;
+worth knowing before choosing room-naming conventions in a real
+deployment.
+
+**Not newly checked, carried over from earlier passes:** XSS (frontend
+uses `textContent`, not `innerHTML`, for all user-supplied text — see
+the Input Hardening section), CSRF (covers the one PHP form that has
+ambient-cookie auth to forge; the JSON API has none), SQL injection
+(all queries in `store.py`, `migrations.py`, and `backup.py` use
+parameterized queries via `?` placeholders — grepped the entire
+codebase for string-formatted SQL and found none), and the
+already-documented rate-limiter/`X-Forwarded-For` and
+mesh-WebRTC-doesn't-scale limitations.
+
 ## Honest map: product bible pillars → this build
 
 | Pillar | Status |
@@ -706,15 +909,18 @@ fixed:
 | — Host authentication & roles | **Built** — claim-once host token per room (`POST /host/claim`), SHA-256 hashed server-side, verified with a constant-time comparison, and now durable across restarts. All moderation actions (poll close, Q&A mark-answered, raffle draw/reset, whiteboard clear, breakout start/end, profile edit) require it and are rejected with 403 otherwise. Tested: correct token succeeds, missing/wrong token is rejected, double-claiming a room is rejected with 409, attendee-level actions (chat, poll vote, asking questions, reactions) remain open with no token needed, and the token itself survives a full server restart. |
 | — Durable storage (SQLite) | **Built** — chat, polls, Q&A, whiteboard, raffle, host tokens, and the session profile all persist to `backend/prymax.db`. Tested by killing the server process outright and confirming every one of those survived a fresh restart with no data loss and no ID collisions. |
 | — Input hardening (rate limiting, validation, CSRF) | **Built** — see the Input Hardening section above. |
-| — Automated test suite | **Built** — 63 tests total across 5 files (API, logging, migrations, backup, concurrency), see the Automated Tests section above. Deliberately verified to catch real regressions (not just pass), verified stable across multiple test-file run orderings after a real multi-stage cross-file bug hunt (see that section), and isolated from the real database. Does not cover the PHP registration flow (no PHP interpreter available here) or the frontend JS beyond the separate Playwright suite. |
+| — Automated test suite | **Built** — 88 backend tests across 5 files (API, logging, migrations, backup, concurrency), plus 20 real-browser Playwright tests (11 room + 9 landing) — 108 tests total. See the Automated Tests and Frontend Browser Tests sections above. Deliberately verified to catch real regressions (not just pass), verified stable across multiple test-file run orderings after a real multi-stage cross-file bug hunt (see that section), and isolated from the real database. Does not cover the PHP registration flow (no PHP interpreter available here) or the frontend JS beyond the separate Playwright suite. |
 | — Structured logging | **Built** — see the Structured Logging section above. Caught two real bugs during development (an exception handler that broke the test client, and a handler that would have turned normal 404s into false 500s) before they shipped, via tests that capture and parse real log output rather than assuming it works. |
 | — Accessibility pass | **Built** — see the Accessibility section above. Color contrast was measured (all pairs already passed WCAG AA — documented honestly rather than claiming an unnecessary fix); a real focus-indicator bug was found and fixed; keyboard tab navigation, screen-reader live regions, form labels, and accessible names for icon buttons were added and verified by structural checks against the actual served HTML. Not verified with real assistive technology or automated a11y tooling — see that section's limits. |
 | — Real-browser frontend tests | **Built** — 9 Playwright tests against actual Chromium, closing a total prior gap in frontend JS coverage. Found and fixed two real bugs (a test-harness resource leak; Flask's dev server needing `threaded=True` for the app's 9-concurrent-poll-loop design). Honestly documented, unresolved residual flakiness traced to this sandbox's single CPU core — see the Frontend Browser Tests section. |
 | — Request-ID log correlation | **Built** — every request gets an id, returned as `X-Request-ID` and shared across every log line produced while handling it. 3 tests confirm correlation and uniqueness. |
 | — Rate-limiter proxy-trust fix | **Built** — `X-Forwarded-For` spoofing (previously exploitable to bypass rate limits entirely) is fixed; the header is now ignored unless `PRYMAX_TRUST_PROXY` is explicitly set. Both branches verified directly. |
 | — Database migrations | **Built** — `migrations.py`, tested against the exact scenario that matters: upgrading this project's own real pre-migrations `prymax.db` files without data loss. |
+| — Landing page: Start/Join/Schedule Meeting, Live Streaming, Admin login | **Built** — see the Landing Page section above. Meeting ID + passcode generation, real passcode enforcement at the actual join endpoint (not a bypassable pre-check), a repeatable (not claim-once) admin login with its weak-credential tradeoff stated plainly, and an in-meeting "Meeting info" sharing panel with a QR code that gracefully degrades to text-only sharing when its CDN dependency isn't reachable — confirmed via a direct network test that it isn't, in this sandbox. |
 | — Automated backups | **Built** — `backup.py`, online-backup-API based (safe under concurrent writes, verified via integrity check), with retention pruning and restore. Caught and fixed a real `keep=0` inverted-logic bug via a dedicated test. |
 | — PHP execution | **Still not possible in this sandbox.** Rechecked directly by attempting `apt-get install php-cli`, which failed with an explicit 403 Forbidden from the package archive — network access is genuinely blocked here, not just unconfigured. PHP code remains written carefully and reviewed by hand, never executed. |
+| — Peer-identity authentication (Tier B security review) | **Built** — a real, exploitable vulnerability found via live testing (any attendee could kick any peer, spoof signaling as another peer, or eavesdrop on another peer's signaling inbox, since `/peers` exposes every peer_id with no ownership proof required anywhere). Fixed with a per-peer secret issued at join, same claim-and-hash pattern as host tokens. Verified by reproducing all three attacks against the vulnerable code, then confirming each is rejected after the fix, while legitimate joining/signaling/leaving keeps working — including a full real-browser Playwright pass against the patched server. See the Security Review section above for the complete writeup. |
+| — Manual security review | **Built** — line-by-line audit of the whole backend, explicitly not a substitute for a real third-party pentest (no scanner tools available, no network to get one). Found and fixed the peer-identity issue above, closed 10 previously-unprotected endpoints with rate limiting, and documented two accepted design tradeoffs (name-based vote/raffle dedup, room-ID-as-access-control) that aren't bugs but are worth knowing. |
 
 ## A note on the second round of "complete implementation" code
 

@@ -108,6 +108,15 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         ALTER TABLE rooms ADD COLUMN host_token_expires_at REAL;
         """,
     ),
+    (
+        4,
+        "add rooms.meeting_passcode and rooms.meeting_type, for scheduled "
+        "meetings and live-stream sessions created from the landing page",
+        """
+        ALTER TABLE rooms ADD COLUMN meeting_passcode TEXT;
+        ALTER TABLE rooms ADD COLUMN meeting_type TEXT;
+        """,
+    ),
 ]
 
 

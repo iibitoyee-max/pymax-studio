@@ -137,36 +137,124 @@ class PryMaxApiTestCase(unittest.TestCase):
         self.assertEqual(roles["Alice"], "host")
         self.assertEqual(roles["Bob"], "attendee")
 
+    def test_join_returns_a_peer_secret(self):
+        res = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"})
+        data = res.get_json()
+        self.assertIn("peer_secret", data)
+        self.assertGreater(len(data["peer_secret"]), 10)
+
+    def test_peers_listing_never_leaks_the_secret(self):
+        self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"})
+        res = self.client.get(f"/api/room/{self.room}/peers")
+        body_text = res.get_data(as_text=True)
+        self.assertNotIn("secret", body_text.lower())
+
+    def test_leave_requires_own_peer_secret(self):
+        """Regression test for a real vulnerability found via live testing:
+        /peers exposes every peer_id to every room member, and /leave
+        originally trusted a bare peer_id with no proof of ownership,
+        letting any attendee forcibly disconnect any other peer."""
+        alice = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"}).get_json()
+
+        no_secret = self.client.post(
+            f"/api/room/{self.room}/leave", json={"peer_id": alice["peer_id"]}
+        )
+        self.assertEqual(no_secret.status_code, 403)
+
+        wrong_secret = self.client.post(
+            f"/api/room/{self.room}/leave",
+            json={"peer_id": alice["peer_id"], "peer_secret": "guessed-wrong"},
+        )
+        self.assertEqual(wrong_secret.status_code, 403)
+
+        still_present = self.client.get(f"/api/room/{self.room}/peers").get_json()
+        self.assertTrue(any(p["peer_id"] == alice["peer_id"] for p in still_present))
+
+        real_leave = self.client.post(
+            f"/api/room/{self.room}/leave",
+            json={"peer_id": alice["peer_id"], "peer_secret": alice["peer_secret"]},
+        )
+        self.assertEqual(real_leave.status_code, 200)
+        after = self.client.get(f"/api/room/{self.room}/peers").get_json()
+        self.assertFalse(any(p["peer_id"] == alice["peer_id"] for p in after))
+
     # -----------------------------------------------------------------
     # Signaling relay
     # -----------------------------------------------------------------
 
     def test_signaling_relay_pass_through(self):
-        pa = self.client.post(
-            f"/api/room/{self.room}/join", json={"name": "Alice"}
-        ).get_json()["peer_id"]
-        pb = self.client.post(
-            f"/api/room/{self.room}/join", json={"name": "Bob"}
-        ).get_json()["peer_id"]
+        alice = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"}).get_json()
+        bob = self.client.post(f"/api/room/{self.room}/join", json={"name": "Bob"}).get_json()
+        pa, pb = alice["peer_id"], bob["peer_id"]
 
         res = self.client.post(
             f"/api/room/{self.room}/signal",
-            json={"to": pa, "from": pb, "type": "offer", "payload": {"sdp": "fake"}},
+            json={
+                "to": pa,
+                "from": pb,
+                "from_secret": bob["peer_secret"],
+                "type": "offer",
+                "payload": {"sdp": "fake"},
+            },
         )
         self.assertEqual(res.status_code, 200)
 
-        inbox = self.client.get(f"/api/room/{self.room}/signal/{pa}").get_json()
+        inbox = self.client.get(
+            f"/api/room/{self.room}/signal/{pa}?secret={alice['peer_secret']}"
+        ).get_json()
         types = [m["type"] for m in inbox]
         self.assertIn("offer", types)
         self.assertIn("peer-joined", types)  # from Bob joining after Alice
 
+    def test_signal_requires_sender_proof(self):
+        alice = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"}).get_json()
+        bob = self.client.post(f"/api/room/{self.room}/join", json={"name": "Bob"}).get_json()
+
+        no_secret = self.client.post(
+            f"/api/room/{self.room}/signal",
+            json={"to": alice["peer_id"], "from": bob["peer_id"], "type": "offer", "payload": {}},
+        )
+        self.assertEqual(no_secret.status_code, 403)
+
+        wrong_secret = self.client.post(
+            f"/api/room/{self.room}/signal",
+            json={
+                "to": alice["peer_id"],
+                "from": bob["peer_id"],
+                "from_secret": "not-the-real-secret",
+                "type": "offer",
+                "payload": {},
+            },
+        )
+        self.assertEqual(wrong_secret.status_code, 403)
+
+    def test_signal_inbox_requires_own_secret(self):
+        alice = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"}).get_json()
+
+        no_secret = self.client.get(f"/api/room/{self.room}/signal/{alice['peer_id']}")
+        self.assertEqual(no_secret.status_code, 403)
+
+        wrong_secret = self.client.get(
+            f"/api/room/{self.room}/signal/{alice['peer_id']}?secret=wrong"
+        )
+        self.assertEqual(wrong_secret.status_code, 403)
+
+        right_secret = self.client.get(
+            f"/api/room/{self.room}/signal/{alice['peer_id']}?secret={alice['peer_secret']}"
+        )
+        self.assertEqual(right_secret.status_code, 200)
+
     def test_signal_to_unknown_peer_is_404(self):
-        pa = self.client.post(
-            f"/api/room/{self.room}/join", json={"name": "Alice"}
-        ).get_json()["peer_id"]
+        alice = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"}).get_json()
         res = self.client.post(
             f"/api/room/{self.room}/signal",
-            json={"to": "does-not-exist", "from": pa, "type": "offer", "payload": {}},
+            json={
+                "to": "does-not-exist",
+                "from": alice["peer_id"],
+                "from_secret": alice["peer_secret"],
+                "type": "offer",
+                "payload": {},
+            },
         )
         self.assertEqual(res.status_code, 404)
 
@@ -387,9 +475,7 @@ class PryMaxApiTestCase(unittest.TestCase):
 
     def test_breakout_round_robin_assignment(self):
         peers = [
-            self.client.post(f"/api/room/{self.room}/join", json={"name": n}).get_json()[
-                "peer_id"
-            ]
+            self.client.post(f"/api/room/{self.room}/join", json={"name": n}).get_json()
             for n in ("A", "B", "C", "D")
         ]
         token = self._claim_host()
@@ -400,13 +486,23 @@ class PryMaxApiTestCase(unittest.TestCase):
         self.assertEqual(start.status_code, 200)
 
         assignments = {
-            pid: self.client.get(f"/api/room/{self.room}/breakout/{pid}").get_json()[
-                "group_index"
-            ]
-            for pid in peers
+            p["peer_id"]: self.client.get(
+                f"/api/room/{self.room}/breakout/{p['peer_id']}?secret={p['peer_secret']}"
+            ).get_json()["group_index"]
+            for p in peers
         }
         # Round-robin over 4 peers into 2 groups: alternating 0,1,0,1
-        self.assertEqual([assignments[p] for p in peers], [0, 1, 0, 1])
+        self.assertEqual([assignments[p["peer_id"]] for p in peers], [0, 1, 0, 1])
+
+    def test_breakout_assignment_requires_own_secret(self):
+        alice = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"}).get_json()
+        token = self._claim_host()
+        self.client.post(
+            f"/api/room/{self.room}/breakout/start",
+            json={"host_token": token, "count": 1, "duration_seconds": 300},
+        )
+        no_secret = self.client.get(f"/api/room/{self.room}/breakout/{alice['peer_id']}")
+        self.assertEqual(no_secret.status_code, 403)
 
     def test_breakout_start_requires_host(self):
         res = self.client.post(
@@ -416,9 +512,7 @@ class PryMaxApiTestCase(unittest.TestCase):
 
     def test_breakout_auto_expires(self):
         token = self._claim_host()
-        pid = self.client.post(
-            f"/api/room/{self.room}/join", json={"name": "A"}
-        ).get_json()["peer_id"]
+        peer = self.client.post(f"/api/room/{self.room}/join", json={"name": "A"}).get_json()
         self.client.post(
             f"/api/room/{self.room}/breakout/start",
             json={"host_token": token, "count": 1, "duration_seconds": 300},
@@ -428,7 +522,9 @@ class PryMaxApiTestCase(unittest.TestCase):
         room = app_module._get_room(self.room)
         room.breakout["started_at"] = time.time() - 301
 
-        status = self.client.get(f"/api/room/{self.room}/breakout/{pid}").get_json()
+        status = self.client.get(
+            f"/api/room/{self.room}/breakout/{peer['peer_id']}?secret={peer['peer_secret']}"
+        ).get_json()
         self.assertFalse(status["active"])
 
     # -----------------------------------------------------------------
@@ -618,6 +714,224 @@ class PryMaxApiTestCase(unittest.TestCase):
             f"/api/room/{self.room}/host/verify", json={"host_token": token}
         )
         self.assertTrue(verify.get_json()["is_host"])
+
+    # -----------------------------------------------------------------
+    # Admin login
+    # -----------------------------------------------------------------
+
+    def test_admin_login_with_correct_credentials_returns_host_token(self):
+        res = self.client.post(
+            "/api/admin/login", json={"username": "Ibitoye", "room": "Superroom"}
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertIn("host_token", data)
+        self.assertEqual(data["room_id"], "Superroom")
+        self.assertEqual(data["role"], "admin")
+
+    def test_admin_login_with_wrong_credentials_rejected(self):
+        wrong_user = self.client.post(
+            "/api/admin/login", json={"username": "NotIbitoye", "room": "Superroom"}
+        )
+        self.assertEqual(wrong_user.status_code, 401)
+
+        wrong_room = self.client.post(
+            "/api/admin/login", json={"username": "Ibitoye", "room": "WrongRoom"}
+        )
+        self.assertEqual(wrong_room.status_code, 401)
+
+        empty = self.client.post("/api/admin/login", json={})
+        self.assertEqual(empty.status_code, 401)
+
+    def test_admin_login_grants_working_host_privileges(self):
+        login = self.client.post(
+            "/api/admin/login", json={"username": "Ibitoye", "room": "Superroom"}
+        ).get_json()
+        token = login["host_token"]
+
+        join = self.client.post(
+            "/api/room/Superroom/join", json={"name": "Ibitoye", "host_token": token}
+        ).get_json()
+        self.assertEqual(join["role"], "host")
+
+        profile = self.client.put(
+            "/api/room/Superroom/profile", json={"host_token": token, "title": "Test"}
+        )
+        self.assertEqual(profile.status_code, 200)
+
+    def test_admin_login_is_repeatable_not_claim_once(self):
+        """Unlike the normal /host/claim flow, admin login must succeed
+        every time with the right credentials — it's a repeatable login,
+        not a one-time claim."""
+        first = self.client.post(
+            "/api/admin/login", json={"username": "Ibitoye", "room": "Superroom"}
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(
+            "/api/admin/login", json={"username": "Ibitoye", "room": "Superroom"}
+        )
+        self.assertEqual(second.status_code, 200)
+        # Each login issues a fresh token; the old one should no longer work.
+        old_token = first.get_json()["host_token"]
+        still_valid = self.client.post(
+            "/api/room/Superroom/host/verify", json={"host_token": old_token}
+        ).get_json()
+        self.assertFalse(still_valid["is_host"])
+
+    # -----------------------------------------------------------------
+    # Scheduled meetings & live streaming
+    # -----------------------------------------------------------------
+
+    def test_schedule_meeting_returns_working_credentials(self):
+        res = self.client.post(
+            "/api/meetings/schedule", json={"name": "Host", "title": "Weekly Sync"}
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertRegex(data["meeting_id"], r"^\d{11}$")
+        self.assertRegex(data["passcode"], r"^[A-Z0-9]{6}$")
+        self.assertIn("host_token", data)
+        self.assertIn(data["meeting_id"], data["join_link"])
+        self.assertIn(data["passcode"], data["join_link"])
+        self.assertEqual(data["type"], "meeting")
+
+    def test_schedule_meeting_ids_are_unique(self):
+        ids = set()
+        for _ in range(10):
+            res = self.client.post("/api/meetings/schedule", json={"name": "Host"})
+            ids.add(res.get_json()["meeting_id"])
+        self.assertEqual(len(ids), 10)
+
+    def test_live_stream_sets_broadcast_profile_mode(self):
+        res = self.client.post(
+            "/api/meetings/schedule", json={"name": "Streamer", "type": "stream"}
+        )
+        data = res.get_json()
+        self.assertEqual(data["type"], "stream")
+        profile = self.client.get(f"/api/room/{data['meeting_id']}/profile").get_json()
+        self.assertEqual(profile["mode"], "rtmp")
+
+    def test_join_scheduled_meeting_requires_correct_passcode(self):
+        meeting = self.client.post(
+            "/api/meetings/schedule", json={"name": "Host"}
+        ).get_json()
+        mid = meeting["meeting_id"]
+
+        no_pass = self.client.post(f"/api/room/{mid}/join", json={"name": "Attendee"})
+        self.assertEqual(no_pass.status_code, 403)
+
+        wrong_pass = self.client.post(
+            f"/api/room/{mid}/join", json={"name": "Attendee", "passcode": "WRONG1"}
+        )
+        self.assertEqual(wrong_pass.status_code, 403)
+
+        right_pass = self.client.post(
+            f"/api/room/{mid}/join", json={"name": "Attendee", "passcode": meeting["passcode"]}
+        )
+        self.assertEqual(right_pass.status_code, 200)
+        self.assertEqual(right_pass.get_json()["role"], "attendee")
+
+    def test_host_can_rejoin_scheduled_meeting_without_passcode(self):
+        meeting = self.client.post(
+            "/api/meetings/schedule", json={"name": "Host"}
+        ).get_json()
+        rejoin = self.client.post(
+            f"/api/room/{meeting['meeting_id']}/join",
+            json={"name": "Host", "host_token": meeting["host_token"]},
+        )
+        self.assertEqual(rejoin.status_code, 200)
+        self.assertEqual(rejoin.get_json()["role"], "host")
+
+    def test_verify_meeting_endpoint(self):
+        meeting = self.client.post(
+            "/api/meetings/schedule", json={"name": "Host", "title": "Verify Test"}
+        ).get_json()
+        mid = meeting["meeting_id"]
+
+        wrong = self.client.post(
+            "/api/meetings/verify", json={"meeting_id": mid, "passcode": "WRONG1"}
+        )
+        self.assertEqual(wrong.status_code, 403)
+
+        right = self.client.post(
+            "/api/meetings/verify", json={"meeting_id": mid, "passcode": meeting["passcode"]}
+        )
+        self.assertEqual(right.status_code, 200)
+        self.assertEqual(right.get_json()["title"], "Verify Test")
+
+        # Formatted (spaced) meeting id, as displayed to the user, must
+        # also work since the frontend/user may paste it with spaces.
+        spaced = self.client.post(
+            "/api/meetings/verify",
+            json={"meeting_id": meeting["meeting_id_display"], "passcode": meeting["passcode"]},
+        )
+        self.assertEqual(spaced.status_code, 200)
+
+        nonexistent = self.client.post(
+            "/api/meetings/verify", json={"meeting_id": "99999999999", "passcode": "X"}
+        )
+        self.assertEqual(nonexistent.status_code, 404)
+
+    def test_ad_hoc_rooms_are_unaffected_by_the_passcode_feature(self):
+        """A plain /join on an ordinary (non-scheduled) room must keep
+        working exactly as before — no passcode required."""
+        res = self.client.post(f"/api/room/{self.room}/join", json={"name": "Alice"})
+        self.assertEqual(res.status_code, 200)
+
+    # -----------------------------------------------------------------
+    # In-meeting sharing (meeting info, for inviting more people mid-call)
+    # -----------------------------------------------------------------
+
+    def test_meeting_info_requires_peer_authentication(self):
+        meeting = self.client.post(
+            "/api/meetings/schedule", json={"name": "Host"}
+        ).get_json()
+        peer = self.client.post(
+            f"/api/room/{meeting['meeting_id']}/join",
+            json={"name": "Attendee", "passcode": meeting["passcode"]},
+        ).get_json()
+
+        no_secret = self.client.get(
+            f"/api/room/{meeting['meeting_id']}/meeting-info/{peer['peer_id']}"
+        )
+        self.assertEqual(no_secret.status_code, 403)
+
+        wrong_secret = self.client.get(
+            f"/api/room/{meeting['meeting_id']}/meeting-info/{peer['peer_id']}?secret=wrong"
+        )
+        self.assertEqual(wrong_secret.status_code, 403)
+
+    def test_meeting_info_returns_shareable_details_for_an_authenticated_peer(self):
+        meeting = self.client.post(
+            "/api/meetings/schedule", json={"name": "Host", "title": "Standup"}
+        ).get_json()
+        peer = self.client.post(
+            f"/api/room/{meeting['meeting_id']}/join",
+            json={"name": "Attendee", "passcode": meeting["passcode"]},
+        ).get_json()
+
+        res = self.client.get(
+            f"/api/room/{meeting['meeting_id']}/meeting-info/{peer['peer_id']}"
+            f"?secret={peer['peer_secret']}"
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertEqual(data["meeting_id"], meeting["meeting_id"])
+        self.assertEqual(data["passcode"], meeting["passcode"])
+        self.assertEqual(data["title"], "Standup")
+        self.assertIn(meeting["meeting_id"], data["join_link"])
+        self.assertIn(meeting["passcode"], data["join_link"])
+
+    def test_meeting_info_for_ad_hoc_room_has_no_passcode(self):
+        peer = self.client.post(
+            f"/api/room/{self.room}/join", json={"name": "Alice"}
+        ).get_json()
+        res = self.client.get(
+            f"/api/room/{self.room}/meeting-info/{peer['peer_id']}?secret={peer['peer_secret']}"
+        )
+        data = res.get_json()
+        self.assertIsNone(data["passcode"])
+        self.assertNotIn("passcode=", data["join_link"])
 
     # -----------------------------------------------------------------
     # helpers
